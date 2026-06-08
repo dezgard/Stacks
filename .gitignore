@@ -1,0 +1,7 @@
+bin/
+obj/
+release/
+*.bak-*
+*.dll
+*.pdb
+*.zip
