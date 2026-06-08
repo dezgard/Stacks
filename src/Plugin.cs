@@ -15,7 +15,7 @@ namespace Stacks
     {
         internal const string PluginGuid = "com.dezgard.ostranauts.stacks";
         internal const string PluginName = "Stacks";
-        internal const string PluginVersion = "0.1.1";
+        internal const string PluginVersion = "0.1.3";
 
         private Harmony _harmony;
 
@@ -58,6 +58,8 @@ namespace Stacks
         private static readonly Dictionary<string, int> DefinitionLimits = new Dictionary<string, int>(StringComparer.Ordinal);
         private static readonly List<LimitRule> ConditionLimits = new List<LimitRule>();
         private static readonly Dictionary<string, int> LogCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        private static readonly MethodInfo ContainerStackOnInsideItemMethod =
+            AccessTools.Method(typeof(Container), "StackOnInsideItem", new Type[] { typeof(CondOwner) });
 
         private static ConfigEntry<int> _defaultContainerLimit;
         private static ConfigEntry<string> _definitionRules;
@@ -319,65 +321,111 @@ namespace Stacks
             return placed != null;
         }
 
-        internal static CondOwner AddWithConfiguredLimit(Container container, CondOwner incoming, string context)
+        internal static CondOwner AddWithConfiguredLimit(Container container, CondOwner objCO, DirectPlacementDecision decision, string context)
+        {
+            if (container == null || objCO == null)
+                return objCO;
+
+            if (decision == null)
+                return objCO;
+
+            // Advanced Stack Transfer
+            if (SafeAllowedCO(container, objCO))
+            {
+                while (objCO != null)
+                {
+                    int nBeforeStack = StackCountSafe(objCO);
+                    objCO = StackOnInsideItem(container, objCO);
+                    if (objCO == null)
+                    {
+                        LogDirectPlacement(context + ":merge-final", decision, null, null, nBeforeStack, 0, PairXY.GetInvalid());
+                        break;
+                    }
+
+                    int nAfterStack = StackCountSafe(objCO);
+                    if (nAfterStack != nBeforeStack)
+                        LogDirectPlacement(context + ":merge", decision, null, objCO, nBeforeStack, nAfterStack, PairXY.GetInvalid());
+
+                    if (container.CanAddSimple(objCO, out var pairXY))
+                    {
+                        int nOriginalCount = StackCountSafe(objCO);
+                        objCO = GetDetachedStack(objCO, decision.Limit, out CondOwner stackCO);
+                        if (stackCO == null)
+                        {
+                            container.AddCOSimple(objCO, pairXY);
+                            LogDirectPlacement(context + ":auto-final", decision, objCO, null, nOriginalCount, 0, pairXY);
+                            objCO = null;
+                        }
+                        else
+                        {
+                            container.AddCOSimple(stackCO, pairXY);
+                            LogDirectPlacement(context + ":auto-tile", decision, stackCO, objCO, nOriginalCount, StackCountSafe(objCO), pairXY);
+                            continue;
+                        }
+                    }
+                    else break;
+                }
+
+                container.Redraw();
+                if (objCO == null)
+                    return objCO;
+            }
+
+            // Fail-Safe Handling
+            CondOwner refCO = objCO;
+            try
+            {
+                foreach (CondOwner aCO in container.GetCOs(false, null))
+                {
+                    if (refCO == null) break;
+                    if (aCO == null || aCO == refCO) continue;
+
+                    int nBeforeCount = StackCountSafe(refCO);
+                    refCO = aCO.AddCO(refCO, false, true, false);
+                    LogDirectPlacement(context + ":overflow", decision, null, refCO, nBeforeCount, StackCountSafe(refCO), PairXY.GetInvalid());
+                }
+            }
+            catch (Exception ex)
+            {
+                _log?.LogWarning("AddWithConfiguredLimit overflow fallback failed: " + ex.GetType().Name + ": " + ex.Message);
+            }
+
+            return refCO;
+
+            // Stack Splitting
+            CondOwner GetDetachedStack(CondOwner refCO, int nStackLimit, out CondOwner stackCO)
+            {
+                stackCO = null;
+                if (refCO == null || nStackLimit <= 0) return refCO;
+                if (StackCountSafe(refCO) <= nStackLimit) return refCO;
+
+                var overflowList = refCO.StackAsList;
+                if (overflowList == null || overflowList.Count <= nStackLimit) return refCO;
+
+                var storedList = overflowList.GetRange(0, nStackLimit);
+                var remainList = overflowList.GetRange(nStackLimit, overflowList.Count - nStackLimit);
+                stackCO = CondOwner.StackFromList(storedList);
+                return remainList.Count > 0 ? CondOwner.StackFromList(remainList) : null;
+            }
+        }
+
+        private static CondOwner StackOnInsideItem(Container container, CondOwner incoming)
         {
             if (container == null || incoming == null)
                 return incoming;
 
-            DirectPlacementDecision directDecision;
-            if (!TryGetDirectPlacementDecision(container, incoming, context, out directDecision))
-                return null;
+            if (ContainerStackOnInsideItemMethod == null)
+                return incoming;
 
-            var remaining = incoming;
-
-            foreach (var candidate in container.GetCOs(true, null))
+            try
             {
-                if (remaining == null)
-                    break;
-
-                if (candidate == null || candidate == remaining || candidate.coStackHead != null)
-                    continue;
-
-                if (candidate.objCOParent != directDecision.ContainerOwner)
-                    continue;
-
-                if (candidate.CanStackOnItem(remaining) <= 0)
-                    continue;
-
-                var beforeCount = StackCountSafe(remaining);
-                remaining = candidate.StackCO(remaining);
-                LogDirectPlacement(context + ":merge", directDecision, null, remaining, beforeCount, StackCountSafe(remaining), PairXY.GetInvalid());
+                return ContainerStackOnInsideItemMethod.Invoke(container, new object[] { incoming }) as CondOwner;
             }
-
-            while (remaining != null)
+            catch (Exception ex)
             {
-                var remainingCount = StackCountSafe(remaining);
-                var placeCount = Math.Min(remainingCount, directDecision.Limit);
-
-                PairXY pairXY;
-                if (!container.CanAddSimple(remaining, out pairXY))
-                    break;
-
-                if (remainingCount > directDecision.Limit)
-                {
-                    CondOwner placed;
-                    CondOwner remainder;
-                    if (!TrySplitDetachedStackForLimit(remaining, directDecision.Limit, out placed, out remainder))
-                        break;
-
-                    container.AddCOSimple(placed, pairXY);
-                    LogDirectPlacement(context + ":auto-tile", directDecision, placed, remainder, remainingCount, StackCountSafe(remainder), pairXY);
-                    remaining = remainder;
-                    continue;
-                }
-
-                container.AddCOSimple(remaining, pairXY);
-                LogDirectPlacement(context + ":auto-final", directDecision, remaining, null, remainingCount, 0, pairXY);
-                remaining = null;
+                _log?.LogWarning("StackOnInsideItem invoke failed: " + ex.GetType().Name + ": " + ex.Message);
+                return incoming;
             }
-
-            container.Redraw();
-            return remaining;
         }
 
         internal static void LogStackDecision(string context, StackRoomDecision decision, int vanillaResult, int finalResult)
@@ -1197,7 +1245,7 @@ namespace Stacks
             if (!StackLimitRules.TryGetDirectPlacementDecision(__instance, objCO, "Container.AddCO", out decision))
                 return true;
 
-            __result = StackLimitRules.AddWithConfiguredLimit(__instance, objCO, "Container.AddCO");
+            __result = StackLimitRules.AddWithConfiguredLimit(__instance, objCO, decision, "Container.AddCO");
             return false;
         }
     }

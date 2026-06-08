@@ -3,7 +3,7 @@
     <TargetFramework>net472</TargetFramework>
     <AssemblyName>Stacks</AssemblyName>
     <RootNamespace>Stacks</RootNamespace>
-    <Version>0.1.1</Version>
+    <Version>0.1.3</Version>
     <LangVersion>latest</LangVersion>
     <GameDir>G:\Steam\steamapps\common\Ostranauts</GameDir>
   </PropertyGroup>
