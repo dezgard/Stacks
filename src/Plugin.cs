@@ -15,7 +15,7 @@ namespace Stacks
     {
         internal const string PluginGuid = "com.dezgard.ostranauts.stacks";
         internal const string PluginName = "Stacks";
-        internal const string PluginVersion = "0.1.3";
+        internal const string PluginVersion = "0.1.6";
 
         private Harmony _harmony;
 
@@ -43,6 +43,7 @@ namespace Stacks
     {
         private const int AbsoluteMaxLimit = 9999;
         private const int DefaultVanillaContainerLimit = 15;
+        private const int DefaultMinimumContainerTiles = 2;
         private const string DefaultConditionRules = "IsBackpack:50,IsDezgardFreightContainer:30,IsDezgardSmallFreightContainer:30";
 
         private static readonly string[] ForbiddenCargoConds =
@@ -65,10 +66,14 @@ namespace Stacks
         private static ConfigEntry<string> _definitionRules;
         private static ConfigEntry<string> _conditionRules;
         private static ConfigEntry<bool> _requireIsContainerForDefaultLimit;
+        private static ConfigEntry<int> _defaultMinimumContainerTiles;
+        private static ConfigEntry<bool> _applyDefaultLimitToNestedContainers;
+        private static ConfigEntry<bool> _splitOversizedStacksForHoldSlots;
         private static ConfigEntry<bool> _logStackDecisions;
         private static ConfigEntry<bool> _logCanFitDecisions;
         private static ConfigEntry<bool> _logStackInsideResults;
         private static ConfigEntry<bool> _logDirectPlacementResults;
+        private static ConfigEntry<bool> _logHoldSlotSplits;
         private static ConfigEntry<int> _maxLogEntriesPerKey;
         private static ConfigEntry<int> _maxLogEntriesPerSession;
         private static ManualLogSource _log;
@@ -117,6 +122,24 @@ namespace Stacks
                 true,
                 "When true, the fallback default limit only applies to owners with IsContainer. Exact definition and condition rules still apply.");
 
+            _defaultMinimumContainerTiles = config.Bind(
+                "StackLimits",
+                "DefaultMinimumContainerTiles",
+                DefaultMinimumContainerTiles,
+                "Fallback default only applies to containers with at least this many grid tiles. Exact definition and condition rules still apply. Set to 0 to include tiny utility holders.");
+
+            _applyDefaultLimitToNestedContainers = config.Bind(
+                "StackLimits",
+                "ApplyDefaultLimitToNestedContainers",
+                false,
+                "When false, nested containers use vanilla behavior unless matched by an exact definition or condition rule.");
+
+            _splitOversizedStacksForHoldSlots = config.Bind(
+                "StackLimits",
+                "SplitOversizedStacksForHoldSlots",
+                true,
+                "When true, dropping an oversized cursor stack onto a hand/hold slot slots only the amount vanilla can hold and leaves the rest on the cursor.");
+
             _logStackDecisions = config.Bind(
                 "Logging",
                 "LogStackDecisions",
@@ -140,6 +163,12 @@ namespace Stacks
                 "LogDirectPlacementResults",
                 true,
                 "Log when Stacks splits an oversized stack before placing it into an empty container tile.");
+
+            _logHoldSlotSplits = config.Bind(
+                "Logging",
+                "LogHoldSlotSplits",
+                true,
+                "Log when Stacks splits an oversized cursor stack for a hand/hold slot.");
 
             _maxLogEntriesPerKey = config.Bind(
                 "Logging",
@@ -518,6 +547,43 @@ namespace Stacks
                 + " leftover=" + DescribeCO(leftover));
         }
 
+        internal static CondOwner CombineDetachedStacks(CondOwner first, CondOwner second)
+        {
+            var stack = new List<CondOwner>();
+
+            if (first != null)
+                stack.AddRange(first.StackAsList);
+
+            if (second != null)
+                stack.AddRange(second.StackAsList);
+
+            if (stack.Count == 0)
+                return null;
+
+            return CondOwner.StackFromList(stack);
+        }
+
+        internal static void LogHoldSlotSplit(string context, Slot slot, CondOwner incoming, CondOwner placed, CondOwner remainder, int originalCount, int room, bool slotted)
+        {
+            if (!LogHoldSlotSplits)
+                return;
+
+            var slotName = slot != null ? slot.strName : "<null>";
+            var key = "HoldSlotSplit|" + context + "|" + slotName + "|" + SafeDef(incoming) + "|" + originalCount + "|" + room + "|" + slotted;
+            LogThrottled(
+                key,
+                "[StacksHoldSlotSplit] context=" + context
+                + " slotted=" + slotted
+                + " slot=" + slotName
+                + " originalCount=" + originalCount
+                + " room=" + room
+                + " placedCount=" + StackCountSafe(placed)
+                + " remainderCount=" + StackCountSafe(remainder)
+                + " incoming=" + DescribeCO(incoming)
+                + " placed=" + DescribeCO(placed)
+                + " remainder=" + DescribeCO(remainder));
+        }
+
         private static bool TryGetLimit(Container container, out int limit, out string source)
         {
             limit = 0;
@@ -548,6 +614,9 @@ namespace Stacks
             }
 
             if (RequireIsContainerForDefaultLimit && !HasCond(owner, "IsContainer"))
+                return false;
+
+            if (!CanUseDefaultLimit(container, owner))
                 return false;
 
             limit = DefaultContainerLimit;
@@ -636,6 +705,24 @@ namespace Stacks
             }
         }
 
+        private static bool CanUseDefaultLimit(Container container, CondOwner owner)
+        {
+            if (container == null || owner == null)
+                return false;
+
+            if (!ApplyDefaultLimitToNestedContainers && owner.objCOParent != null && owner.objCOParent.objContainer != null)
+                return false;
+
+            var minTiles = DefaultMinimumTilesForDefaultLimit;
+            if (minTiles > 0)
+            {
+                if (container.gridLayout == null || container.gridLayout.gridMaxSpace < minTiles)
+                    return false;
+            }
+
+            return true;
+        }
+
         private static bool HasCond(CondOwner co, string cond)
         {
             try
@@ -650,9 +737,12 @@ namespace Stacks
 
         private static int StackCountSafe(CondOwner co)
         {
+            if (co == null)
+                return 0;
+
             try
             {
-                return co != null && co.StackCount > 0 ? co.StackCount : 1;
+                return co.StackCount > 0 ? co.StackCount : 1;
             }
             catch
             {
@@ -676,6 +766,27 @@ namespace Stacks
             get { return _requireIsContainerForDefaultLimit == null || _requireIsContainerForDefaultLimit.Value; }
         }
 
+        private static int DefaultMinimumTilesForDefaultLimit
+        {
+            get
+            {
+                if (_defaultMinimumContainerTiles == null)
+                    return DefaultMinimumContainerTiles;
+
+                return Math.Max(_defaultMinimumContainerTiles.Value, 0);
+            }
+        }
+
+        private static bool ApplyDefaultLimitToNestedContainers
+        {
+            get { return _applyDefaultLimitToNestedContainers != null && _applyDefaultLimitToNestedContainers.Value; }
+        }
+
+        internal static bool SplitOversizedStacksForHoldSlots
+        {
+            get { return _splitOversizedStacksForHoldSlots == null || _splitOversizedStacksForHoldSlots.Value; }
+        }
+
         private static bool LogStackDecisions
         {
             get { return _logStackDecisions == null || _logStackDecisions.Value; }
@@ -694,6 +805,11 @@ namespace Stacks
         private static bool LogDirectPlacementResults
         {
             get { return _logDirectPlacementResults == null || _logDirectPlacementResults.Value; }
+        }
+
+        private static bool LogHoldSlotSplits
+        {
+            get { return _logHoldSlotSplits == null || _logHoldSlotSplits.Value; }
         }
 
         private static int MaxLogEntriesPerKey
@@ -971,6 +1087,10 @@ namespace Stacks
             typeof(GUIInventoryItem),
             "ProcessRemainder",
             new Type[] { typeof(CondOwner), typeof(GUIInventoryWindow), typeof(CondOwner), typeof(Ship) });
+        private static readonly FieldInfo GUIInventoryInstanceField =
+            typeof(GUIInventory).GetField("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly FieldInfo GUIInventoryTargetWindowField =
+            typeof(GUIInventory).GetField("targetWindow", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
         internal static bool TryHandleMoveInventories(GUIInventoryItem item, GUIInventoryWindow destination, Vector2 position, bool canPlaceSelf, out bool result)
         {
@@ -999,6 +1119,9 @@ namespace Stacks
                     return false;
 
                 result = PlaceOneLimitedStack(item, container, destination, pairXY, decision, "MoveInventories");
+                if (result)
+                    SetQuickTransferTarget(destination);
+
                 return true;
             }
             catch (Exception ex)
@@ -1081,6 +1204,61 @@ namespace Stacks
             }
         }
 
+        internal static bool TryHandleSlotAtScreenPosition(GUIInventoryItem item, Vector2 screenPosition, bool canPlaceSelf, out bool result)
+        {
+            result = false;
+
+            try
+            {
+                if (!StackLimitRules.SplitOversizedStacksForHoldSlots || item == null || item.CO == null)
+                    return false;
+
+                var incoming = item.CO;
+                var originalCount = SafeStackCount(incoming);
+                if (originalCount <= 1)
+                    return false;
+
+                var guiInventory = GUIInventory.instance;
+                if (guiInventory == null || guiInventory.PaperDollManager == null)
+                    return false;
+
+                var slots = guiInventory.PaperDollManager.GetSlotsForScreenPosition(screenPosition);
+                if (slots == null || slots.Count == 0)
+                    return false;
+
+                foreach (var screenSlot in slots)
+                {
+                    Slot slot;
+                    JsonSlotEffects slotEffects;
+                    if (!TryGetPrimaryHoldSlot(screenSlot, incoming, out slot, out slotEffects))
+                        continue;
+
+                    if (!HasEmptySlot(slot))
+                        continue;
+
+                    var room = slot.OpenSpaces(incoming, false);
+                    if (room <= 0)
+                        continue;
+
+                    if (slotEffects.aSlotsSecondary != null && !CanSecondarySlotsFit(slot, incoming, room, slotEffects))
+                        continue;
+
+                    if (room >= originalCount)
+                        return false;
+
+                    result = SplitAndSlotHoldStack(item, slot, incoming, originalCount, room);
+                    return true;
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogWarning("Stacks SlotAtScreenPosition split failed: " + ex.GetType().Name + ": " + ex.Message);
+                return false;
+            }
+        }
+
         private static bool PlaceOneLimitedStack(GUIInventoryItem item, Container container, GUIInventoryWindow destination, PairXY pairXY, StackLimitRules.DirectPlacementDecision decision, string context)
         {
             var incoming = item.CO;
@@ -1104,6 +1282,122 @@ namespace Stacks
             StackLimitRules.LogDirectPlacement(context + ":direct", decision, placed, remainder, originalCount, SafeStackCount(remainder), pairXY);
             FinishGuiMove(item, destination, remainder, previousContainer, previousShip);
             return true;
+        }
+
+        private static bool SplitAndSlotHoldStack(GUIInventoryItem item, Slot slot, CondOwner incoming, int originalCount, int room)
+        {
+            var previousShip = incoming.ship;
+            var previousWindow = item.windowData;
+
+            incoming.RemoveFromCurrentHome();
+
+            CondOwner placed;
+            CondOwner remainder;
+            if (!StackLimitRules.TrySplitDetachedStackForLimit(incoming, room, out placed, out remainder))
+                return false;
+
+            if (placed.Item != null)
+                placed.Item.fLastRotation = item.fRotLast;
+
+            UnityEngine.Object.Destroy(item.gameObject);
+            CrewSim.objInstance?.SetPartCursor(null);
+
+            var slotted = slot.compSlots != null && slot.compSlots.SlotItem(slot.strName, placed, false);
+            if (!slotted)
+            {
+                var restored = StackLimitRules.CombineDetachedStacks(remainder, placed);
+                SpawnRemainderOnCursor(restored, previousShip);
+                RedrawSourceWindow(previousWindow);
+                StackLimitRules.LogHoldSlotSplit("SlotAtScreenPosition:slot-failed", slot, incoming, placed, remainder, originalCount, room, false);
+                return true;
+            }
+
+            SpawnRemainderOnCursor(remainder, previousShip);
+            RedrawSourceWindow(previousWindow);
+            StackLimitRules.LogHoldSlotSplit("SlotAtScreenPosition", slot, incoming, placed, remainder, originalCount, room, true);
+            return true;
+        }
+
+        private static bool TryGetPrimaryHoldSlot(Slot screenSlot, CondOwner incoming, out Slot slot, out JsonSlotEffects slotEffects)
+        {
+            slot = null;
+            slotEffects = null;
+
+            if (screenSlot == null || incoming == null || incoming.mapSlotEffects == null)
+                return false;
+
+            if (string.IsNullOrEmpty(screenSlot.strName))
+                return false;
+
+            if (!incoming.mapSlotEffects.TryGetValue(screenSlot.strName, out slotEffects) || slotEffects == null)
+                return false;
+
+            slot = screenSlot;
+            if (!string.Equals(slotEffects.strSlotPrimary, screenSlot.strName, StringComparison.Ordinal))
+            {
+                if (screenSlot.compSlots == null || string.IsNullOrEmpty(slotEffects.strSlotPrimary))
+                    return false;
+
+                slot = screenSlot.compSlots.GetSlot(slotEffects.strSlotPrimary);
+                if (slot == null || string.IsNullOrEmpty(slot.strName))
+                    return false;
+
+                if (!incoming.mapSlotEffects.TryGetValue(slot.strName, out slotEffects) || slotEffects == null)
+                    return false;
+            }
+
+            if (slot.compSlots == null || !slot.bHoldSlot)
+                return false;
+
+            return true;
+        }
+
+        private static bool CanSecondarySlotsFit(Slot primarySlot, CondOwner incoming, int room, JsonSlotEffects slotEffects)
+        {
+            if (primarySlot == null || primarySlot.compSlots == null || incoming == null || slotEffects == null)
+                return false;
+
+            if (slotEffects.aSlotsSecondary == null)
+                return true;
+
+            foreach (var secondaryName in slotEffects.aSlotsSecondary)
+            {
+                var secondarySlot = primarySlot.compSlots.GetSlot(secondaryName);
+                if (secondarySlot == null || secondarySlot.OpenSpaces(incoming, false) < room)
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool HasEmptySlot(Slot slot)
+        {
+            if (slot == null || slot.aCOs == null)
+                return false;
+
+            foreach (var slotted in slot.aCOs)
+            {
+                if (slotted == null)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static void SpawnRemainderOnCursor(CondOwner remainder, Ship previousShip)
+        {
+            if (remainder == null)
+                return;
+
+            var guiItem = GUIInventoryItem.SpawnInventoryItem(remainder.strID);
+            if (guiItem != null)
+                guiItem.AttachToCursor(previousShip);
+        }
+
+        private static void RedrawSourceWindow(GUIInventoryWindow window)
+        {
+            if (window != null)
+                window.Redraw();
         }
 
         private static void FinishGuiMove(GUIInventoryItem item, GUIInventoryWindow destination, CondOwner remainder, CondOwner previousContainer, Ship previousShip)
@@ -1152,6 +1446,30 @@ namespace Stacks
             var guiItem = GUIInventoryItem.SpawnInventoryItem(remainder.strID);
             if (guiItem != null)
                 guiItem.AttachToCursor();
+        }
+
+        private static void SetQuickTransferTarget(GUIInventoryWindow destination)
+        {
+            if (destination == null)
+                return;
+
+            try
+            {
+                object guiInventory = null;
+
+                if (GUIInventoryInstanceField != null)
+                    guiInventory = GUIInventoryInstanceField.GetValue(null);
+
+                if (guiInventory == null)
+                    return;
+
+                if (GUIInventoryTargetWindowField != null)
+                    GUIInventoryTargetWindowField.SetValue(guiInventory, destination);
+            }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogWarning("Stacks failed to sync quick-transfer target: " + ex.GetType().Name + ": " + ex.Message);
+            }
         }
 
         private static PairXY GetDropPair(GUIInventoryItem item, GUIInventoryWindow destination, Vector2 position)
@@ -1273,6 +1591,22 @@ namespace Stacks
         {
             bool result;
             if (DirectPlacementHandler.TryHandleStackOrAddToContainer(__instance, container, out result))
+            {
+                __result = result;
+                return false;
+            }
+
+            return true;
+        }
+    }
+
+    [HarmonyPatch(typeof(GUIInventoryItem), "SlotAtScreenPosition", new Type[] { typeof(Vector2), typeof(bool) })]
+    internal static class GUIInventoryItemSlotAtScreenPositionPatch
+    {
+        private static bool Prefix(GUIInventoryItem __instance, Vector2 screenPosition, bool canPlaceSelf, ref bool __result)
+        {
+            bool result;
+            if (DirectPlacementHandler.TryHandleSlotAtScreenPosition(__instance, screenPosition, canPlaceSelf, out result))
             {
                 __result = result;
                 return false;
